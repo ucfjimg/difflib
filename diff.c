@@ -43,7 +43,7 @@ FILE *fp[2];
 void oom_abort()
 {
     fprintf(stderr, "\nout of memory\n");
-    exit(1);
+    exit(2);
 }
 
 /**
@@ -210,7 +210,6 @@ unsigned sh_search(serhash_t *V, eclass_t *E, int n, unsigned hash)
         } else if (hash > mid_h) {
             low = mid + 1;
         } else {
-            printf("mid %d\n", mid);
             while (!E[mid-1].last) {
                 mid--;
             }
@@ -343,44 +342,55 @@ void parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
     }
 }
 
-void merge(candidate_t **K, int *k, int i, vec_t *E, int p)
+// K is array of rightmost K-candidates
+// k is the highest k-candidate found
+// i is the index into the left string
+// E is the list of equivalence classes
+// p is the index of the first eq class matching left[i] in E
+int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
 {
-    int r = 0;
+    int l = 0;
+
     candidate_t *c = K[0];
-    int s;
+    candidate_t *t;
+    int lowk = 0;
 
-    for(;;) {
-        int j = EV_AT(E, p)->serial;
+    for (; !l; l = E[p].last, p++) {
+        int j = E[p].serial;
 
-        // TODO bsearch
-        for (s = r; s <= *k; s++) {
-            if (K[s]->b < j && K[s+1]->b > j) {
+        // criteria for a k-candidate
+        // (1) Ai == Bj (we already know this is true)
+        // (2) LCS exists between the A[:i] and B[:j]
+        // (3) No common sequence of length k if either i or j reduced
+        int fndk = -1;
+        for (int ik = lowk; ik <= k; ik++) {
+            if (K[ik]->b < j && K[ik+1]->b > j) {
+                fndk = ik;
                 break;
             }
         }
 
-        if (s <= *k) {
-            if (K[s+1]->b > j) {
-                K[r] = c;
-                r = s + 1;
-                c = candidate(i, j, K[s]);
-            }
-
-            if (s == *k) {
-                K[*k+2] = K[*k+1];
-                ++*k;
-                break;
-            }
-        }
-
-        if (EV_AT(E, p)->last) {
+        if (fndk == -1) {
             break;
         }
 
-        p++;
+        // now, (i,j) is a fndk+1-candidate
+        t = K[fndk];
+        K[lowk] = c;        // save previous new entry
+        c = candidate(i, j, t);
+        lowk = fndk + 1;
+
+        if (fndk == k) {
+            k++;
+            K[k+1] = K[k];
+            break;
+        }
     }
 
-    K[r] = c;
+    K[lowk] = c;
+
+
+    return k;
 }
 
 void usage(void)
@@ -414,28 +424,9 @@ int main(int argc, char **argv)
     } 
 
     parse_right_file(fp[1], &V);
-
-    printf("V hash serial:\n");
-    for (i = 0; i < V.n; i++) {
-        serhash_t *sh = SH_AT(&V, i);
-        printf(" %u %u\n", sh->hash, sh->serial);
-    }
-
     sh_sort(&V);
     buildeq(&V, &E);
-
-    printf("E serial last:\n");
-    for (i = 0; i < E.n; i++) {
-        eclass_t *ec = EV_AT(&E, i);
-        printf(" %u %u\n", ec->serial, ec->last);
-    }
-
     parse_left_file(fp[0], &V, &E, &P);
-
-    printf("P index into E:\n");
-    for (i = 0; i < P.n; i++) {
-        printf(" %u\n", *INTV_AT(&P, i));
-    }
 
     vec_free(&V);
 
@@ -451,16 +442,53 @@ int main(int argc, char **argv)
     pp = INTV_AT(&P, 0);
     for (i = 1; i <= m; i++) {
         if (pp[i]) {
-            merge(K, &k, i, &E, pp[i]);
+            k = merge(K, k, i, EV_AT(&E, 0), pp[i]);
         }
     }
 
-    for (i = 0; i <= k; i++) {
-        candidate_t *c;
-        printf("i = %u\n", i);
+    candidate_t *pr, *cu, *nx;
 
-        for (c = K[i]; c; c = c->prev) {
-            printf("  (%u,%u)\n", c->a, c->b);
+    pr = candidate(m, n, NULL);
+    cu = K[k];
+
+    while (cu) {
+        nx = cu->prev;
+        cu->prev = pr;
+        pr = cu;
+        cu = nx;
+    }
+
+    int l = -1, r = -1;
+
+    for (; pr; pr = pr->prev) {
+        if (l+1 != pr->a || r+1 != pr->b) {
+            if (r+1 == pr->b) {
+                printf("%d", l+1);
+                if (l+2 < pr->a) {
+                    printf(",%d", pr->a-1);
+                }
+                printf("d%d\n", r);
+            } else if (l+1 == pr->a) {
+                printf("%da%d", l, r+1);
+                if (r+2 < pr->b) {
+                    printf("%d", pr->b-1);
+                }
+                printf("\n");
+            } else {                
+                printf("%d", l+1);
+                if (l+2 < pr->a) {
+                    printf(",%d", pr->a-1);
+                }
+                printf("c");
+                printf("%d", r+1);
+                if (r+2 < pr->b) {
+                    printf("%d", pr->b-1);
+                }
+                printf("\n");
+            }
         }
+
+        l = pr->a;
+        r = pr->b;
     }
 }
