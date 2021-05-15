@@ -32,8 +32,6 @@ struct candidate_t {
     candidate_t *prev;
 };
 
-FILE *fp[2];
-
 /*****************************************************************************
  * Memory routines
  */
@@ -389,8 +387,44 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
 
     K[lowk] = c;
 
-
     return k;
+}
+
+void printdiff(candidate_t *pr)
+{
+    int l = -1, r = -1;
+
+    for (; pr; pr = pr->prev) {
+        if (l+1 != pr->a || r+1 != pr->b) {
+            if (r+1 == pr->b) {
+                printf("%d", l+1);
+                if (l+2 < pr->a) {
+                    printf(",%d", pr->a-1);
+                }
+                printf("d%d\n", r);
+            } else if (l+1 == pr->a) {
+                printf("%da%d", l, r+1);
+                if (r+2 < pr->b) {
+                    printf("%d", pr->b-1);
+                }
+                printf("\n");
+            } else {                
+                printf("%d", l+1);
+                if (l+2 < pr->a) {
+                    printf(",%d", pr->a-1);
+                }
+                printf("c");
+                printf("%d", r+1);
+                if (r+2 < pr->b) {
+                    printf("%d", pr->b-1);
+                }
+                printf("\n");
+            }
+        }
+
+        l = pr->a;
+        r = pr->b;
+    }
 }
 
 void usage(void)
@@ -400,6 +434,7 @@ void usage(void)
 
 int main(int argc, char **argv)
 {
+    FILE *fp[2];
     int i;
     vec_t V;
     vec_t E;
@@ -458,37 +493,5 @@ int main(int argc, char **argv)
         cu = nx;
     }
 
-    int l = -1, r = -1;
-
-    for (; pr; pr = pr->prev) {
-        if (l+1 != pr->a || r+1 != pr->b) {
-            if (r+1 == pr->b) {
-                printf("%d", l+1);
-                if (l+2 < pr->a) {
-                    printf(",%d", pr->a-1);
-                }
-                printf("d%d\n", r);
-            } else if (l+1 == pr->a) {
-                printf("%da%d", l, r+1);
-                if (r+2 < pr->b) {
-                    printf("%d", pr->b-1);
-                }
-                printf("\n");
-            } else {                
-                printf("%d", l+1);
-                if (l+2 < pr->a) {
-                    printf(",%d", pr->a-1);
-                }
-                printf("c");
-                printf("%d", r+1);
-                if (r+2 < pr->b) {
-                    printf("%d", pr->b-1);
-                }
-                printf("\n");
-            }
-        }
-
-        l = pr->a;
-        r = pr->b;
-    }
+    printdiff(pr);
 }
