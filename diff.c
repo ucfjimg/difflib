@@ -1,3 +1,9 @@
+//
+// TODO 
+//   better memory handling for library
+//   do we really need J[] or can we go directly to deltas?
+//   split into library interface
+//
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -445,6 +451,27 @@ void parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
     }
 }
 
+int merge_search(candidate_t **K, int low, int high, int j)
+{
+    while (low <= high)
+    {
+        int mid = (low + high) / 2;
+        int rs = K[mid]->b;
+        int re = K[mid+1]->b;
+        if (j > rs && j < re) {
+            return mid;
+        } 
+
+        if (j < rs) {
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    return -1;
+}
+
 // K is array of rightmost K-candidates
 // k is the highest k-candidate found
 // i is the index into the left string
@@ -465,14 +492,7 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
         // (1) Ai == Bj (we already know this is true)
         // (2) LCS exists between the A[:i] and B[:j]
         // (3) No common sequence of length k if either i or j reduced
-        int fndk = -1;
-        for (int ik = lowk; ik <= k; ik++) {
-            if (K[ik]->b < j && K[ik+1]->b > j) {
-                fndk = ik;
-                break;
-            }
-        }
-
+        int fndk = merge_search(K, lowk, k, j);
         if (fndk == -1) {
             break;
         }
