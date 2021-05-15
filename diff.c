@@ -32,6 +32,19 @@ struct candidate_t {
     candidate_t *prev;
 };
 
+typedef struct range_t range_t; 
+struct range_t {
+    int start;
+    int end;
+};
+
+typedef struct delta_t delta_t;
+
+struct delta_t {
+    range_t left;
+    range_t right;
+};
+
 /*****************************************************************************
  * Memory routines
  */
@@ -149,6 +162,15 @@ void vec_free(vec_t *v)
 #define INTV_APPEND(iv) ((int*)(vec_append(iv)))
 #define INTV_AT(iv, idx) \
     ( ((int*)((iv)->data)) + (idx) )
+
+/*****************************************************************************
+ * vector of deltas
+ */
+#define DV_INIT(dv) vec_init(dv, sizeof(delta_t))
+#define DV_APPEND(dv) ((delta_t*)(vec_append(dv)))
+#define DV_AT(dv, idx) \
+    ( ((delta_t*)((dv)->data)) + (idx) )
+
 
 /*****************************************************************************
  * serial-hash functions
@@ -275,6 +297,65 @@ int next_line(FILE *fp, unsigned *phash)
     return 1;
 }
 
+void skiplines(FILE *fp, int n)
+{
+    int ch;
+
+    for (; n; n--) {
+        if (feof(fp)) {
+            return;
+        }
+
+        while ((ch = fgetc(fp)) != EOF) {
+            if (ch == '\r' || ch == '\n') {
+                break;
+            }
+        }
+
+        if (ch == '\r') {
+            ch == fgetc(fp);
+            if (ch != '\n') {
+                ungetc(ch, fp);
+            }
+        }
+    }
+}
+
+int complines(FILE *fp[])
+{
+    int rc = 0;
+    int ch[2];
+    int i;
+
+    for (;;) {
+        ch[0] = fgetc(fp[0]);
+        ch[1] = fgetc(fp[1]);
+
+        if (ch[0] != ch[1]) {
+            rc = 1;
+        }
+
+        if (ch[0] == EOF || ch[0] == '\r' || ch[0] == '\n') {
+            break;
+        }
+    }
+
+    for (i = 0; i < 2; i++) {
+        while (ch[i] != EOF && ch[i] != '\n' && ch[i] != '\r') {
+            ch[i] = fgetc(fp[i]);
+        }
+
+        if (ch[i] == '\r') {
+            ch[i] = fgetc(fp[i]);
+            if (ch[i] != '\n') {
+                ungetc(ch[i], fp[i]);
+            }
+        }
+    }
+
+    return rc;
+}
+
 /**
  * Parse the right-hand file into (serial, hash) pairs where serial is 
  * the one-based line number. 
@@ -390,40 +471,134 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
     return k;
 }
 
-void printdiff(candidate_t *pr)
+void dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *k)
 {
-    int l = -1, r = -1;
+    int n = E->n;
+    int m = P->n;
+    int k_size = MIN(m, n) + 2;
+    *K = (candidate_t **)safe_malloc(k_size * sizeof(candidate_t *));
+    *k = 0;
+    int i;
 
-    for (; pr; pr = pr->prev) {
-        if (l+1 != pr->a || r+1 != pr->b) {
-            if (r+1 == pr->b) {
-                printf("%d", l+1);
-                if (l+2 < pr->a) {
-                    printf(",%d", pr->a-1);
-                }
-                printf("d%d\n", r);
-            } else if (l+1 == pr->a) {
-                printf("%da%d", l, r+1);
-                if (r+2 < pr->b) {
-                    printf("%d", pr->b-1);
-                }
-                printf("\n");
-            } else {                
-                printf("%d", l+1);
-                if (l+2 < pr->a) {
-                    printf(",%d", pr->a-1);
-                }
-                printf("c");
-                printf("%d", r+1);
-                if (r+2 < pr->b) {
-                    printf("%d", pr->b-1);
-                }
-                printf("\n");
-            }
+    (*K)[0] = candidate(0, 0, NULL);
+    (*K)[1] = candidate(m + 1, n + 1, NULL);
+
+    int *pp = INTV_AT(P, 0);
+    for (i = 1; i <= m; i++) {
+        if (pp[i]) {
+            *k = merge(*K, *k, i, EV_AT(E, 0), pp[i]);
+        }
+    }
+}
+
+void jackpot(int m, int *J, FILE *fp[])
+{
+    rewind(fp[0]);
+    rewind(fp[1]);
+    int l = 1;
+    int r = 1;
+    int i;
+
+    for (i = 1; i <= m; i++) {
+        if (J[i] == 0) {
+            continue;
         }
 
-        l = pr->a;
-        r = pr->b;
+        if (l < i) {
+            skiplines(fp[0], i - l);
+            l = i;
+        }
+
+        if (r < J[i]) {
+            skiplines(fp[1], J[i] - r);
+            r = J[i];
+        }
+
+        if (complines(fp) != 0) {
+            printf("JACKPOT!\n");
+            J[i] = 0;
+        }
+
+        l++, r++;
+    }
+}
+
+int *build_matches(int m, int n, candidate_t *kk)
+{
+    int i;
+    int *J;
+    candidate_t *pc;
+
+    J = (int*)safe_malloc(sizeof(int*) * (m+1));
+    for (i = 0; i <= m; i++) {
+        J[i] = 0;
+    }
+
+    for (pc = kk; pc != NULL; pc = pc->prev) {
+        J[pc->a] = pc->b;
+    }
+    J[m] = n;
+
+    return J;
+}
+
+void build_deltas(vec_t *dv, int m, int *J)
+{
+    DV_INIT(dv);
+
+    int l = 0, r = 0;
+    for (int i = 1; i <= m; i++) {
+        delta_t *delta;
+
+        if (J[i] == 0) {
+            continue;
+        }
+        
+        if (l+1 == i && r+1 == J[i]) {
+            l++;
+            r++;
+            continue;
+        }
+
+        delta = DV_APPEND(dv);
+        delta->left.start = l + 1;
+        delta->left.end = i;
+        delta->right.start = r + 1;
+        delta->right.end = J[i];
+        
+        l = i;
+        r = J[i];
+    }
+}
+
+void printdiff(vec_t *dv)
+{
+    for (int i = 0; i < dv->n; i++) {
+        delta_t *delta = DV_AT(dv, i);
+
+        if (delta->right.start == delta->right.end) {
+            printf("%d", delta->left.start);
+            if (delta->left.end > delta->left.start + 1) {
+                printf(",%d", delta->left.end - 1);
+            }
+            printf("d%d\n", delta->right.start - 1);
+        } else if (delta->left.start == delta->left.end) {
+            printf("%da%d", delta->left.start - 1, delta->right.start);
+            if (delta->right.end > delta->right.start + 1) {
+                printf(",%d", delta->right.end - 1);
+            }
+            printf("\n"); 
+        } else {
+            printf("%d", delta->left.start);
+            if (delta->left.end > delta->left.start + 1) {
+                printf(",%d", delta->left.end - 1);
+            }
+            printf("c%d", delta->right.start);
+            if (delta->right.end > delta->right.start + 1) {
+                printf(",%d", delta->right.end - 1);
+            }
+            printf("\n"); 
+        }
     }
 }
 
@@ -442,7 +617,9 @@ int main(int argc, char **argv)
     int m, n;
     int k_size, k;
     candidate_t **K;
+    candidate_t *pr;
     int *pp;
+    int *J;
 
     if (argc != 3) { 
         usage();
@@ -462,36 +639,17 @@ int main(int argc, char **argv)
     sh_sort(&V);
     buildeq(&V, &E);
     parse_left_file(fp[0], &V, &E, &P);
-
     vec_free(&V);
 
-    n = E.n;
+    n = E.n; 
     m = P.n;
 
-    k_size = MIN(m, n) + 2;
-    K = (candidate_t **)safe_malloc(k_size * sizeof(candidate_t *));
-    k = 0;
-    K[0] = candidate(0, 0, NULL);
-    K[1] = candidate(m + 1, n + 1, NULL);
+    dodiff(&E, &P, &K, &k);
+    J = build_matches(m, n, K[k]);
+    jackpot(m, J, fp);
 
-    pp = INTV_AT(&P, 0);
-    for (i = 1; i <= m; i++) {
-        if (pp[i]) {
-            k = merge(K, k, i, EV_AT(&E, 0), pp[i]);
-        }
-    }
+    vec_t dv;
+    build_deltas(&dv, m, J);
 
-    candidate_t *pr, *cu, *nx;
-
-    pr = candidate(m, n, NULL);
-    cu = K[k];
-
-    while (cu) {
-        nx = cu->prev;
-        cu->prev = pr;
-        pr = cu;
-        cu = nx;
-    }
-
-    printdiff(pr);
+    printdiff(&dv);
 }
