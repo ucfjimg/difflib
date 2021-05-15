@@ -301,7 +301,7 @@ void skiplines(FILE *fp, int n)
 {
     int ch;
 
-    for (; n; n--) {
+    while (n--) {
         if (feof(fp)) {
             return;
         }
@@ -317,6 +317,30 @@ void skiplines(FILE *fp, int n)
             if (ch != '\n') {
                 ungetc(ch, fp);
             }
+        }
+    }
+}
+
+void printline(FILE *fp)
+{
+    int ch;
+
+    if (feof(fp)) {
+        return;
+    }
+
+    while ((ch = fgetc(fp)) != EOF) {
+        if (ch == '\r' || ch == '\n') {
+            break;
+        }
+        fputc(ch, stdout);
+    }
+    fputc('\n', stdout);
+
+    if (ch == '\r') {
+        ch == fgetc(fp);
+        if (ch != '\n') {
+            ungetc(ch, fp);
         }
     }
 }
@@ -571,8 +595,23 @@ void build_deltas(vec_t *dv, int m, int *J)
     }
 }
 
-void printdiff(vec_t *dv)
+void printrange(FILE *fp, int skip, int print, char prefix)
 {
+    skiplines(fp, skip);
+    while (print--) {
+        printf("%c ", prefix);
+        printline(fp);
+    }
+}
+
+void printdiff(FILE *fp[], vec_t *dv)
+{
+    int l = 1;
+    int r = 1;
+
+    rewind(fp[0]);
+    rewind(fp[1]);
+
     for (int i = 0; i < dv->n; i++) {
         delta_t *delta = DV_AT(dv, i);
 
@@ -582,12 +621,16 @@ void printdiff(vec_t *dv)
                 printf(",%d", delta->left.end - 1);
             }
             printf("d%d\n", delta->right.start - 1);
+            printrange(fp[0], delta->left.start - l, delta->left.end - delta->left.start, '<');
+            l = delta->left.end;
         } else if (delta->left.start == delta->left.end) {
             printf("%da%d", delta->left.start - 1, delta->right.start);
             if (delta->right.end > delta->right.start + 1) {
                 printf(",%d", delta->right.end - 1);
             }
             printf("\n"); 
+            printrange(fp[1], delta->right.start - r, delta->right.end - delta->right.start, '>');
+            r = delta->right.end;
         } else {
             printf("%d", delta->left.start);
             if (delta->left.end > delta->left.start + 1) {
@@ -598,10 +641,14 @@ void printdiff(vec_t *dv)
                 printf(",%d", delta->right.end - 1);
             }
             printf("\n"); 
+            printrange(fp[0], delta->left.start - l, delta->left.end - delta->left.start, '<');
+            l = delta->left.end;
+            printrange(fp[1], delta->right.start - r, delta->right.end - delta->right.start, '>');
+            r = delta->right.end;
         }
     }
 }
-
+ 
 void usage(void)
 {
     fprintf(stderr, "diff: file-1 file-1\n");
@@ -615,10 +662,8 @@ int main(int argc, char **argv)
     vec_t E;
     vec_t P;
     int m, n;
-    int k_size, k;
+    int k;
     candidate_t **K;
-    candidate_t *pr;
-    int *pp;
     int *J;
 
     if (argc != 3) { 
@@ -651,5 +696,5 @@ int main(int argc, char **argv)
     vec_t dv;
     build_deltas(&dv, m, J);
 
-    printdiff(&dv);
+    printdiff(fp, &dv);
 }
