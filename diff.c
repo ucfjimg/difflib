@@ -1,7 +1,6 @@
 //
 // TODO 
 //   better memory handling for library
-//   do we really need J[] or can we go directly to deltas?
 //   split into library interface
 //
 #include <stdio.h>
@@ -11,26 +10,36 @@
 # define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
+// Pair of serial (line number) and line hash
+//
 typedef struct serhash_t serhash_t;
 struct serhash_t {
     unsigned serial;
     unsigned hash;
 };
 
+// Pair of serial (line number) and 'last' flag, indicating this
+// is the last line in an equivalence class
+//
 typedef struct eclass_t eclass_t;
 struct eclass_t {
     unsigned serial;
     int last;
 };
 
+// A generic vector 
+//
 typedef struct vec_t vec_t;
 struct vec_t {
-    size_t elesize;
-    unsigned alloc;
-    unsigned n;
-    char *data;
+    size_t elesize;         // size of each element
+    unsigned alloc;         // # of elements allocated
+    unsigned n;             // # of elements in use
+    char *data;             // -> storage
 };
 
+// A k-candidate, with line number for the left and right file each
+// prev is used to link chains of k-candidates
+//
 typedef struct candidate_t candidate_t;
 struct candidate_t {
     int a;
@@ -38,14 +47,17 @@ struct candidate_t {
     candidate_t *prev;
 };
 
+// A range of lines, [start..end)
+//
 typedef struct range_t range_t; 
 struct range_t {
     int start;
     int end;
 };
 
+// A change between the two files; two ranges of lines that differ
+//
 typedef struct delta_t delta_t;
-
 struct delta_t {
     range_t left;
     range_t right;
@@ -54,18 +66,19 @@ struct delta_t {
 /*****************************************************************************
  * Memory routines
  */
-/**
- * Immediately ditch if we run out of memory.
- */
+
+//
+// Immediately ditch if we run out of memory.
+//
 void oom_abort()
 {
     fprintf(stderr, "\nout of memory\n");
     exit(2);
 }
 
-/**
- * Allocate memory, guaranteed to succeed or exit.
- */
+//
+// Allocate memory, guaranteed to succeed or exit.
+//
 void *safe_malloc(size_t n)
 {
     void *p = malloc(n);
@@ -75,9 +88,9 @@ void *safe_malloc(size_t n)
     return p;
 }
 
-/**
- * Reallocate memory, guaranteed to succeed or exit.
- */
+//
+// Reallocate memory, guaranteed to succeed or exit.
+//
 void *safe_realloc(void *p, size_t n)
 {
     p = realloc(p, n);
@@ -87,9 +100,9 @@ void *safe_realloc(void *p, size_t n)
     return p;
 }
 
-/**
- * Free an allocated pointer
- */
+//
+// Free an allocated pointer
+//
 void safe_free(void *p)
 {
     free(p);
@@ -99,9 +112,9 @@ void safe_free(void *p)
  * Generic vector  
  */
 
-/**
- * Initialize an empty vector
- */
+//
+// Initialize an empty vector
+//
 void vec_init(vec_t *pv, size_t elesize)
 {
     const unsigned INITIAL_ALLOC = 16;
@@ -112,9 +125,9 @@ void vec_init(vec_t *pv, size_t elesize)
     pv->data = safe_malloc(elesize * INITIAL_ALLOC);
 }
 
-/**
- * Add an element to a node vector
- */
+//
+// Add an element to a vector
+//
 void *vec_append(vec_t *pv)
 {
     size_t oldsize, newsize;
@@ -124,7 +137,7 @@ void *vec_append(vec_t *pv)
         pv->alloc *= 2;
         newsize = pv->alloc * pv->elesize;
         if (newsize <= oldsize) {
-            // file way too many lines
+            // size has wrapped around, too big!
             oom_abort();
         }
         pv->data = safe_realloc(pv->data, newsize);
@@ -134,9 +147,9 @@ void *vec_append(vec_t *pv)
     return &pv->data[pv->elesize * (pv->n - 1)];
 }
 
-/**
- * Free a vector's data
- */
+//
+// Free a vector's data
+//
 void vec_free(vec_t *v)
 {
     safe_free(v->data);
@@ -182,9 +195,9 @@ void vec_free(vec_t *v)
  * serial-hash functions
  */
 
-/**
- * Compare two serial-hash nodes on hash, then serial
- */
+//
+// Compare two serial-hash nodes on hash, then serial
+//
 int sh_compare(const void *l, const void *r)
 {
     const serhash_t *ln = (const serhash_t *)l;
@@ -209,24 +222,26 @@ int sh_compare(const void *l, const void *r)
     return 0;
 }
 
-/**
- * Sort a serial-hash vector on hash, then serial
- */
+//
+// Sort a serial-hash vector on hash, then serial
+//
 void sh_sort(vec_t *sh)
 {
-    // NB we skip the first placeholder node
+    // NB we skip the first placeholder element
     qsort(sh->data + sizeof(serhash_t), sh->n - 1, sizeof(serhash_t), &sh_compare);
 }
 
-/**
- * Search for the last occurance of an equivalence class (based on hash)
- * in the given sh vector. Return the index or 0 if there is no match.
- */
+//
+// Search for the last occurance of an equivalence class (based on hash)
+// in the given sh vector. Return the index or 0 if there is no match.
+//
 unsigned sh_search(serhash_t *V, eclass_t *E, int n, unsigned hash)
 {
     unsigned low = 1;
     unsigned high = n - 1;
 
+    // since the array is sorted, we can binary search to find any class
+    // member and then back up to find the first class element
     while (low <= high) {
         unsigned mid = (low + high) / 2;
         unsigned mid_h = V[mid].hash;
@@ -250,6 +265,9 @@ unsigned sh_search(serhash_t *V, eclass_t *E, int n, unsigned hash)
 /*****************************************************************************
  * candidates
  */
+
+// constructor function for a k-candidate
+//
 candidate_t* candidate(int a, int b, candidate_t *prev)
 {
     candidate_t *p = (candidate_t *)safe_malloc(sizeof(candidate_t));
@@ -263,12 +281,12 @@ candidate_t* candidate(int a, int b, candidate_t *prev)
  * file parsing and algorithm
  */
 
-/**
- * Read the next line from 'fp' and compute its hash.
- * 
- * Return 1 on success with 'phash' containing the hash.
- * Return 0 on EOF w/ no data to hash. 
- */
+//
+// Read the next line from 'fp' and compute its hash.
+// 
+// Return 1 on success with 'phash' containing the hash.
+// Return 0 on EOF w/ no data to hash. 
+//
 int next_line(FILE *fp, unsigned *phash)
 {
     int ch;
@@ -303,6 +321,8 @@ int next_line(FILE *fp, unsigned *phash)
     return 1;
 }
 
+// Skip the next 'n' lines in the input file
+//
 void skiplines(FILE *fp, int n)
 {
     int ch;
@@ -327,6 +347,8 @@ void skiplines(FILE *fp, int n)
     }
 }
 
+// print the rest of the line the file pointer currently points at
+//
 void printline(FILE *fp)
 {
     int ch;
@@ -351,6 +373,11 @@ void printline(FILE *fp)
     }
 }
 
+// Compare the current lines starting at  fp[0] and fp[1].
+// Return 0 on match and non-zero on mismatch. Even if the lines
+// don't match, both file pointers will be advanced past the
+// terminating newline.
+//
 int complines(FILE *fp[])
 {
     int rc = 0;
@@ -386,10 +413,10 @@ int complines(FILE *fp[])
     return rc;
 }
 
-/**
- * Parse the right-hand file into (serial, hash) pairs where serial is 
- * the one-based line number. 
- */
+//
+// Parse the right-hand file into (serial, hash) pairs where serial is 
+// the one-based line number. 
+//
 void parse_right_file(FILE *fp, vec_t *V)
 {
     unsigned hash;
@@ -407,9 +434,9 @@ void parse_right_file(FILE *fp, vec_t *V)
     }
 }
 
-/**
- * Build the equivalence classes for a vector of (serial, hash) pairs.
- */
+//
+// Build the equivalence classes for a vector of (serial, hash) pairs.
+//
 void buildeq(vec_t *V, vec_t *E)
 {
     int i;
@@ -433,10 +460,10 @@ void buildeq(vec_t *V, vec_t *E)
     }
 }
 
-/**
- * Parse the left hand file in terms of the right hand file's
- * eq classes.
- */
+//
+// Parse the left hand file in terms of the right hand file's
+// eq classes.
+//
 void parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
 {
     unsigned hash;
@@ -451,8 +478,17 @@ void parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
     }
 }
 
+// Search between K[low] and K[high] for an index where 
+// K[s]->b < j and K[s+1]->b > j. Note that this implies
+// that K[high+1] must exist.
+//
+// Return the index s if found, else -1.
+//
 int merge_search(candidate_t **K, int low, int high, int j)
 {
+    // K is kept in order of increasing b so we can
+    // use binary search 
+    //
     while (low <= high)
     {
         int mid = (low + high) / 2;
@@ -472,6 +508,11 @@ int merge_search(candidate_t **K, int low, int high, int j)
     return -1;
 }
 
+// Given a line number in the left-hand file, look at all identical
+// lines in the right-handle file in increasing order of line nuber
+// (via the equivalence relation data computed earlier) and merge them
+// into k-candidate chains. 
+//
 // K is array of rightmost K-candidates
 // k is the highest k-candidate found
 // i is the index into the left string
@@ -515,6 +556,9 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
     return k;
 }
 
+// Take the equivalence relations between the left and right files
+// and compute the actual diff in the form of k-candidate chains
+//
 void dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *k)
 {
     int n = E->n;
@@ -535,6 +579,10 @@ void dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *k)
     }
 }
 
+// Scan for jackpots (dissimilar lines which have the same hash)
+// If these are in J, then the lines aren't really equivalent and
+// we remove the relation.
+//
 void jackpot(int m, int *J, FILE *fp[])
 {
     rewind(fp[0]);
@@ -567,6 +615,10 @@ void jackpot(int m, int *J, FILE *fp[])
     }
 }
 
+// Take the longest candidate chain and transform it into an array,
+// indexed by lines numbers of the left file, containing the matching
+// line number in the right file, or 0 if there is no matching line. 
+//
 int *build_matches(int m, int n, candidate_t *kk)
 {
     int i;
@@ -586,6 +638,10 @@ int *build_matches(int m, int n, candidate_t *kk)
     return J;
 }
 
+// From the i <-> j array matching lines between the two files,
+// build a representation of the differences in terms of blocks
+// of lines in each file.
+//
 void build_deltas(vec_t *dv, int m, int *J)
 {
     DV_INIT(dv);
@@ -615,6 +671,10 @@ void build_deltas(vec_t *dv, int m, int *J)
     }
 }
 
+// From the given file pointer, skip the next 'skip' lines, and
+// the print the next 'print' lines to stdout, each prefaced with
+// 'prefix' and a space.
+//
 void printrange(FILE *fp, int skip, int print, char prefix)
 {
     skiplines(fp, skip);
@@ -624,6 +684,8 @@ void printrange(FILE *fp, int skip, int print, char prefix)
     }
 }
 
+// Print the diff in ed-command format
+//
 void printdiff(FILE *fp[], vec_t *dv)
 {
     int l = 1;
@@ -669,6 +731,8 @@ void printdiff(FILE *fp[], vec_t *dv)
     }
 }
  
+// Print the (minimal) usage format
+//
 void usage(void)
 {
     fprintf(stderr, "diff: file-1 file-1\n");
