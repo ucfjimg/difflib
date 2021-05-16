@@ -13,6 +13,8 @@
 # define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
+#define NULL_INDEX (-1)
+
 // Pair of serial (line number) and line hash
 //
 typedef struct serhash_t serhash_t;
@@ -47,7 +49,7 @@ typedef struct candidate_t candidate_t;
 struct candidate_t {
     int a;
     int b;
-    candidate_t *prev;
+    int prev;
 };
 
 // A range of lines, [start..end)
@@ -75,7 +77,8 @@ struct diffstate_t {
     vec_t V;                // (hash, serial) pairs of right hand file
     vec_t E;                // (serial, last) pairs of right hand file eq classes
     vec_t P;                // left hand file points by line into matching eq class in E
-    candidate_t **K;        // rightmost k-candidate pointers for each K
+    vec_t cp;               // candidate pool
+    int *K;                 // rightmost k-candidate pointers for each K
     int *J;                 // left-right matchines at end of alg
     vec_t dv;               // vector of delta ranges for output construction
 };
@@ -159,6 +162,7 @@ int vec_clamp(vec_t *pv)
         return -ENOMEM;
     }
     pv->alloc = nalloc;
+    pv->data = newp;
     return 0;
 }
 
@@ -206,6 +210,15 @@ void vec_free(vec_t *v)
 #define DV_APPEND(dv) ((delta_t*)(vec_append(dv)))
 #define DV_AT(dv, idx) \
     ( ((delta_t*)((dv)->data)) + (idx) )
+
+/*****************************************************************************
+ * vector of candidate
+ */
+#define CP_INIT(cp) vec_init(cp, sizeof(candidate_t))
+#define CP_APPEND(cp) ((candidate_t*)(vec_append(cp)))
+#define CP_AT(cp, idx) \
+    ( ((candidate_t*)((cp)->data)) + (idx) )
+
 
 
 /*****************************************************************************
@@ -283,17 +296,26 @@ unsigned sh_search(serhash_t *V, eclass_t *E, int n, unsigned hash)
  * candidates
  */
 
-// constructor function for a k-candidate
+// Candidates are small and already have a lot of per-alloc overhead,
+// so used a custom allocator for them
 //
-candidate_t* candidate(int a, int b, candidate_t *prev)
+
+// constructor function for a k-candidate
+// 
+// Returns the index of the new candidate, or -ENOMEM if out of memory
+//
+int candidate(vec_t *cp, int a, int b, int prev)
 {
-    candidate_t *p = (candidate_t *)malloc(sizeof(candidate_t));
-    if (p != NULL) {
-        p->a = a;
-        p->b = b;
-        p->prev = prev;
+    candidate_t *p = CP_APPEND(cp);
+    if (p == NULL) {
+        return -ENOMEM;
     }
-    return p;
+
+    p->a = a;
+    p->b = b;
+    p->prev = prev;
+
+    return cp->n - 1;
 }
 
 /*****************************************************************************
@@ -573,9 +595,9 @@ int parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
 // K[s]->b < j and K[s+1]->b > j. Note that this implies
 // that K[high+1] must exist.
 //
-// Return the index s if found, else -1.
+// Return the index s if found, else NULL_INDEX.
 //
-int merge_search(candidate_t **K, int low, int high, int j)
+int merge_search(vec_t *cp, int *K, int low, int high, int j)
 {
     // K is kept in order of increasing b so we can
     // use binary search 
@@ -583,8 +605,8 @@ int merge_search(candidate_t **K, int low, int high, int j)
     while (low <= high)
     {
         int mid = (low + high) / 2;
-        int rs = K[mid]->b;
-        int re = K[mid+1]->b;
+        int rs = CP_AT(cp, K[mid])->b;
+        int re = CP_AT(cp, K[mid+1])->b;
         if (j > rs && j < re) {
             return mid;
         } 
@@ -596,7 +618,7 @@ int merge_search(candidate_t **K, int low, int high, int j)
         }
     }
 
-    return -1;
+    return NULL_INDEX;
 }
 
 // Given a line number in the left-hand file, look at all identical
@@ -604,7 +626,8 @@ int merge_search(candidate_t **K, int low, int high, int j)
 // (via the equivalence relation data computed earlier) and merge them
 // into k-candidate chains. 
 //
-// K is array of rightmost K-candidates
+// cp is candidate storage vector
+// K is array of rightmost K-candidates (indices into cp)
 // k is the highest k-candidate found
 // i is the index into the left string
 // E is the list of equivalence classes
@@ -612,12 +635,12 @@ int merge_search(candidate_t **K, int low, int high, int j)
 //
 // Returns 0 on success or -ENOMEM on out of memory
 //
-int merge(candidate_t **K, int *pk, int i, eclass_t *E, int p)
+int merge(vec_t *cp, int *K, int *pk, int i, eclass_t *E, int p)
 {
     int l = 0;
 
-    candidate_t *c = K[0];
-    candidate_t *t;
+    int c = K[0];
+    int t;
     int lowk = 0;
     int k = *pk;
 
@@ -628,16 +651,16 @@ int merge(candidate_t **K, int *pk, int i, eclass_t *E, int p)
         // (1) Ai == Bj (we already know this is true)
         // (2) LCS exists between the A[:i] and B[:j]
         // (3) No common sequence of length k if either i or j reduced
-        int fndk = merge_search(K, lowk, k, j);
-        if (fndk == -1) {
+        int fndk = merge_search(cp, K, lowk, k, j);
+        if (fndk == NULL_INDEX) {
             continue;
         }
 
         // now, (i,j) is a fndk+1-candidate
         t = K[fndk];
         K[lowk] = c;        // save previous new entry
-        c = candidate(i, j, t);
-        if (c == NULL) {
+        c = candidate(cp, i, j, t);
+        if (c < 0) {
             return -ENOMEM;
         }
         lowk = fndk + 1;
@@ -659,7 +682,7 @@ int merge(candidate_t **K, int *pk, int i, eclass_t *E, int p)
 //
 // Returns 0 on success or -ENOMEM on out of memory
 //
-int dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *pk)
+int dodiff(vec_t *cp, vec_t *E, vec_t *P, int **K, int *pk)
 {
     int rc;
     int n = E->n;
@@ -667,23 +690,31 @@ int dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *pk)
     int k_size = MIN(m, n) + 2;
     int k = 0;
     int i;
+    int c;
 
-    if ((*K = (candidate_t **)malloc(k_size * sizeof(candidate_t *))) == NULL) {
+    rc = CP_INIT(cp);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if ((*K = (int*)malloc(k_size * sizeof(int))) == NULL) {
         return -ENOMEM;
     }
 
-    if (((*K)[0] = candidate(0, 0, NULL)) == NULL) {
-        return -ENOMEM;
+    if ((c = candidate(cp, 0, 0, NULL_INDEX)) < 0) {
+        return c;
     }
+    (*K)[0] = c;
 
-    if (((*K)[1] = candidate(m + 1, n + 1, NULL)) == NULL) {
-        return -ENOMEM;
+    if ((c = candidate(cp, m + 1, n + 1, NULL_INDEX)) < 0) {
+        return c;
     }
+    (*K)[1] = c;
 
     int *pp = INTV_AT(P, 0);
-    for (i = 1; i <= m; i++) {
+    for (i = 1; i < m; i++) {
         if (pp[i]) {
-            rc = merge(*K, &k, i, EV_AT(E, 0), pp[i]);
+            rc = merge(cp, *K, &k, i, EV_AT(E, 0), pp[i]);
             if (rc != 0) {
                 return rc;
             }
@@ -748,11 +779,10 @@ int jackpot(int m, int *J, FILE *fp[])
 //
 // Returns the match array or NULL on out of memory
 //
-int *build_matches(int m, int n, candidate_t *kk)
+int *build_matches(vec_t *cp, int m, int n, int c)
 {
     int i;
     int *J;
-    candidate_t *pc;
 
     J = (int*)malloc(sizeof(int*) * (m+1));
     if (J == NULL) {
@@ -763,7 +793,8 @@ int *build_matches(int m, int n, candidate_t *kk)
         J[i] = 0;
     }
 
-    for (pc = kk; pc != NULL; pc = pc->prev) {
+    for (; c != NULL_INDEX; c = CP_AT(cp, c)->prev) {
+        candidate_t *pc = CP_AT(cp, c);
         J[pc->a] = pc->b;
     }
     J[m] = n;
@@ -926,6 +957,7 @@ void freediff(diffstate_t *ds)
     free(ds->K);
     free(ds->J);
     vec_free(&ds->dv);
+    vec_free(&ds->cp);
 }
 
 int main(int argc, char **argv)
@@ -950,7 +982,7 @@ int main(int argc, char **argv)
             perror(fn);
             return 1;
         }
-    } 
+    }
 
     if ((rc = parse_right_file(ds.fp[1], &ds.V)) != 0) {
         goto fail;
@@ -971,11 +1003,11 @@ int main(int argc, char **argv)
     n = ds.E.n; 
     m = ds.P.n;
 
-    if ((rc = dodiff(&ds.E, &ds.P, &ds.K, &k)) != 0) {
+    if ((rc = dodiff(&ds.cp, &ds.E, &ds.P, &ds.K, &k)) != 0) {
         goto fail;
     }
 
-    if ((ds.J = build_matches(m, n, ds.K[k])) == NULL) {
+    if ((ds.J = build_matches(&ds.cp, m, n, ds.K[k])) == NULL) {
         rc = -ENOMEM;
         goto fail;
     }
