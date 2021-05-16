@@ -149,12 +149,16 @@ int vec_clamp(vec_t *pv)
 {
     char *newp;
 
-    newp = realloc(pv->data, pv->elesize * pv->n);
+    // NB realloc() with a 0 size is free and returns NULL, keep a minimum pointer
+    //
+    size_t nalloc = pv->n ? pv->n : 1;
+
+    newp = realloc(pv->data, pv->elesize * nalloc);
     if (newp == NULL) {
         // shouldn't happen since we're shrinking
         return -ENOMEM;
     }
-    pv->alloc = pv->n;
+    pv->alloc = nalloc;
     return 0;
 }
 
@@ -626,7 +630,7 @@ int merge(candidate_t **K, int *pk, int i, eclass_t *E, int p)
         // (3) No common sequence of length k if either i or j reduced
         int fndk = merge_search(K, lowk, k, j);
         if (fndk == -1) {
-            break;
+            continue;
         }
 
         // now, (i,j) is a fndk+1-candidate
