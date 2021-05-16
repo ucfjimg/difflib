@@ -3,6 +3,8 @@
 //   better memory handling for library
 //   split into library interface
 //
+#include <err.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,8 +35,8 @@ struct eclass_t {
 typedef struct vec_t vec_t;
 struct vec_t {
     size_t elesize;         // size of each element
-    unsigned alloc;         // # of elements allocated
-    unsigned n;             // # of elements in use
+    size_t alloc;           // # of elements allocated
+    size_t n;               // # of elements in use
     char *data;             // -> storage
 };
 
@@ -79,83 +81,58 @@ struct diffstate_t {
 };
 
 /*****************************************************************************
- * Memory routines
- */
-
-//
-// Immediately ditch if we run out of memory.
-//
-void oom_abort()
-{
-    fprintf(stderr, "\nout of memory\n");
-    exit(2);
-}
-
-//
-// Allocate memory, guaranteed to succeed or exit.
-//
-void *safe_malloc(size_t n)
-{
-    void *p = malloc(n);
-    if (!p) {
-        oom_abort();
-    }
-    return p;
-}
-
-//
-// Reallocate memory, guaranteed to succeed or exit.
-//
-void *safe_realloc(void *p, size_t n)
-{
-    p = realloc(p, n);
-    if (!p) {
-        oom_abort();
-    }
-    return p;
-}
-
-//
-// Free an allocated pointer
-//
-void safe_free(void *p)
-{
-    free(p);
-}
-
-/*****************************************************************************
  * Generic vector  
  */
 
 //
 // Initialize an empty vector
 //
-void vec_init(vec_t *pv, size_t elesize)
+// Returns 0 on success or -ENOMEM on out of memory
+//
+int vec_init(vec_t *pv, size_t elesize)
 {
     const unsigned INITIAL_ALLOC = 16;
 
     pv->elesize = elesize;
     pv->alloc = INITIAL_ALLOC;
     pv->n = 0;
-    pv->data = safe_malloc(elesize * INITIAL_ALLOC);
+    pv->data = malloc(elesize * INITIAL_ALLOC);
+    if (pv->data == NULL) {
+        return -ENOMEM;
+    }
+    return 0;
 }
 
 //
 // Add an element to a vector
 //
+// Returns the new element or NULL on out of memory
+//
 void *vec_append(vec_t *pv)
 {
     size_t oldsize, newsize;
+    size_t newalloc;
+    char *newp;
 
     if (pv->n == pv->alloc) {
         oldsize = pv->alloc * pv->elesize;
-        pv->alloc *= 2;
-        newsize = pv->alloc * pv->elesize;
+        newalloc *= 2;
+        newsize = newalloc * pv->elesize;
         if (newsize <= oldsize) {
             // size has wrapped around, too big!
-            oom_abort();
+            return NULL;
         }
-        pv->data = safe_realloc(pv->data, newsize);
+        newp = realloc(pv->data, newsize);
+        if (newp == NULL) {
+            newalloc = pv->alloc + 1;
+            newsize = newalloc * pv->elesize;
+            newp = realloc(pv->data, newsize);
+            if (newp == NULL) {
+                return NULL;
+            }
+        }
+        pv->alloc = newalloc;
+        pv->data = newp;
     }
 
     pv->n++;
@@ -166,10 +143,19 @@ void *vec_append(vec_t *pv)
 // in use. used to recover space reserved for new elements when it's known
 // that the vector will never again need to grow.
 //
-void vec_clamp(vec_t *pv)
+// Return 0 on success or -ENOMEM on out of memory
+//
+int vec_clamp(vec_t *pv)
 {
-    pv->data = safe_realloc(pv->data, pv->elesize * pv->n);
+    char *newp;
+
+    newp = realloc(pv->data, pv->elesize * pv->n);
+    if (newp == NULL) {
+        // shouldn't happen since we're shrinking
+        return -ENOMEM;
+    }
     pv->alloc = pv->n;
+    return 0;
 }
 
 //
@@ -178,7 +164,7 @@ void vec_clamp(vec_t *pv)
 void vec_free(vec_t *v)
 {
     if (v->data) {
-        safe_free(v->data);
+        free(v->data);
         v->data = NULL;
         v->alloc = 0;
         v->n = 0;
@@ -297,10 +283,12 @@ unsigned sh_search(serhash_t *V, eclass_t *E, int n, unsigned hash)
 //
 candidate_t* candidate(int a, int b, candidate_t *prev)
 {
-    candidate_t *p = (candidate_t *)safe_malloc(sizeof(candidate_t));
-    p->a = a;
-    p->b = b;
-    p->prev = prev;
+    candidate_t *p = (candidate_t *)malloc(sizeof(candidate_t));
+    if (p != NULL) {
+        p->a = a;
+        p->b = b;
+        p->prev = prev;
+    }
     return p;
 }
 
@@ -308,15 +296,42 @@ candidate_t* candidate(int a, int b, candidate_t *prev)
  * file parsing and algorithm
  */
 
+// If ch is an end of line char, skip any possible newline combination
+// Also check for EOF due to error.
+//
+// Return 0 on success, -EIO on I/O error
+//
+int skipeol(FILE *fp, int ch) 
+{
+    if (ch == EOF && ferror(fp)) {
+        return -EIO;
+    }
+
+    if (ch == '\r') {
+        ch = fgetc(fp);
+        if (ch != '\n') {
+            if (ungetc(ch, fp) == EOF) {
+                return -EIO;
+            }
+        } else if (ch == EOF && ferror(fp)) {
+            return -EIO;
+        }
+    }
+    return 0;
+}
+
 //
 // Read the next line from 'fp' and compute its hash.
 // 
 // Return 1 on success with 'phash' containing the hash.
 // Return 0 on EOF w/ no data to hash. 
+// Return -EIO on I/O error.
 //
 int next_line(FILE *fp, unsigned *phash)
 {
+    int rc;
     int ch;
+    int len = 0;
     const unsigned HASH0 = 5381;
     unsigned hash = HASH0;
 
@@ -324,24 +339,19 @@ int next_line(FILE *fp, unsigned *phash)
         return 0;
     }
 
-    while ((ch = fgetc(fp)) != EOF) {
-        if (ch == '\r' || ch == '\n') {
-            break;
-        }
+    while ((ch = fgetc(fp)) != EOF && ch != '\r' && ch != '\n') {
+        len++;
         hash = ((hash << 5) + hash) + ch;
     }
 
-    // we read a blank link that ended in EOF - that counts as EOF
-    //
-    if (ch == EOF && hash == HASH0) {
-        return 0;
+    if ((rc = skipeol(fp, ch)) != 0) {
+        return rc;
     }
 
-    if (ch == '\r') {
-        ch = fgetc(fp);
-        if (ch != '\n') {
-            ungetc(ch, fp);
-        }
+    if (ch == EOF && len == 0) {
+        // empty line at EOF
+        //
+        return 0;
     }
 
     *phash = hash;
@@ -350,70 +360,73 @@ int next_line(FILE *fp, unsigned *phash)
 
 // Skip the next 'n' lines in the input file
 //
-void skiplines(FILE *fp, int n)
+// Return 0 on success or -EIO on I/O error
+//
+int skiplines(FILE *fp, int n)
 {
+    int rc;
     int ch;
 
     while (n--) {
         if (feof(fp)) {
-            return;
+            break;
         }
 
-        while ((ch = fgetc(fp)) != EOF) {
-            if (ch == '\r' || ch == '\n') {
-                break;
-            }
+        while ((ch = fgetc(fp)) != EOF && ch != '\r' && ch != '\n') {
         }
 
-        if (ch == '\r') {
-            ch == fgetc(fp);
-            if (ch != '\n') {
-                ungetc(ch, fp);
-            }
+        if ((rc = skipeol(fp, ch)) != 0) {
+            return rc;
         }
     }
+
+    return 0;
 }
 
 // print the rest of the line the file pointer currently points at
 //
-void printline(FILE *fp)
+int printline(FILE *fp)
 {
+    int rc;
     int ch;
 
     if (feof(fp)) {
-        return;
+        return 0;
     }
 
-    while ((ch = fgetc(fp)) != EOF) {
-        if (ch == '\r' || ch == '\n') {
-            break;
-        }
+    while ((ch = fgetc(fp)) != EOF && ch != '\r' && ch != '\n') {
         fputc(ch, stdout);
     }
     fputc('\n', stdout);
 
-    if (ch == '\r') {
-        ch == fgetc(fp);
-        if (ch != '\n') {
-            ungetc(ch, fp);
-        }
+    if ((rc = skipeol(fp, ch)) != 0) {
+        return rc;
     }
+
+    return 0;
 }
 
 // Compare the current lines starting at  fp[0] and fp[1].
-// Return 0 on match and non-zero on mismatch. Even if the lines
+// Return 0 on match and 1 on mismatch. Even if the lines
 // don't match, both file pointers will be advanced past the
 // terminating newline.
+//
+// Returns -EIO on I/O error on either file
 //
 int complines(FILE *fp[])
 {
     int rc = 0;
+    int skiprc;
     int ch[2];
     int i;
 
     for (;;) {
         ch[0] = fgetc(fp[0]);
         ch[1] = fgetc(fp[1]);
+        
+        if ((ch[0] == EOF && ferror(fp[0])) || (ch[1] == EOF && ferror(fp[1]))) {
+            return -EIO;
+        }
 
         if (ch[0] != ch[1]) {
             rc = 1;
@@ -429,11 +442,8 @@ int complines(FILE *fp[])
             ch[i] = fgetc(fp[i]);
         }
 
-        if (ch[i] == '\r') {
-            ch[i] = fgetc(fp[i]);
-            if (ch[i] != '\n') {
-                ungetc(ch[i], fp[i]);
-            }
+        if ((skiprc = skipeol(fp[i], ch[i])) != 0) {
+            return skiprc;
         }
     }
 
@@ -442,38 +452,63 @@ int complines(FILE *fp[])
 
 //
 // Parse the right-hand file into (serial, hash) pairs where serial is 
-// the one-based line number. 
+// the one-based line number.
 //
-void parse_right_file(FILE *fp, vec_t *V)
+// Returns 0 on success 
+// -ENOMEM on out of memory
+// -EIO on I/O error 
+//
+int parse_right_file(FILE *fp, vec_t *V)
 {
+    int rc;
     unsigned hash;
     serhash_t *sh;
 
-    SH_INIT(V);
-    sh = SH_APPEND(V);
+    if ((rc = SH_INIT(V)) != 0) {
+        return rc;
+    }
+
+    if ((sh = SH_APPEND(V)) == NULL) {
+        return -ENOMEM;
+    }
     sh->hash = ~1;
     sh->serial = 0;
 
-    while (next_line(fp, &hash)) {
-        sh = SH_APPEND(V);
+    while ((rc = next_line(fp, &hash)) == 1) {
+        if ((sh = SH_APPEND(V)) == NULL) {
+            return -ENOMEM;
+        }
         sh->serial = V->n - 1;
         sh->hash = hash;
     }
 
-    vec_clamp(V);
+    if (rc < 0) {
+        return rc;
+    }
+
+    return vec_clamp(V);
 }
 
 //
 // Build the equivalence classes for a vector of (serial, hash) pairs.
 //
-void buildeq(vec_t *V, vec_t *E)
+// Return 0 on success or -ENOMEM on out of memory
+//
+int buildeq(vec_t *V, vec_t *E)
 {
+    int rc;
     int i;
     serhash_t *sh;
     eclass_t *ec;
 
-    EV_INIT(E);
-    ec = EV_APPEND(E);
+    if ((rc = EV_INIT(E)) != 0) {
+        return rc;
+    }
+
+    if ((ec = EV_APPEND(E)) == NULL) {
+        return -ENOMEM;
+    }
+
     ec->serial = 0;
     ec->last = 1;
     
@@ -483,32 +518,51 @@ void buildeq(vec_t *V, vec_t *E)
 
     for (i = 1; i < V->n; i++) {
         sh = SH_AT(V, i);
-        ec = EV_APPEND(E);
+        if ((ec = EV_APPEND(E)) == NULL) {
+            return -ENOMEM;
+        }
         ec->serial = sh->serial;
         ec->last = (i == V->n - 1) || (sh->hash != sh[1].hash); 
     }
 
-    vec_clamp(E);
+    return vec_clamp(E);
 }
 
 //
 // Parse the left hand file in terms of the right hand file's
 // eq classes.
 //
-void parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
+// Returns 0 on success 
+// -ENOMEM on out of memory
+// -EIO on I/O error 
+//
+int parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
 {
+    int rc;
     unsigned hash;
+    int *pi;
     int i;
 
-    INTV_INIT(P);
-    *INTV_APPEND(P) = 0;
-
-    while (next_line(fp, &hash)) {
-        i = sh_search(SH_AT(V, 0), EV_AT(E, 0), V->n, hash);
-        *INTV_APPEND(P) = i;
+    if ((rc = INTV_INIT(P)) != 0) {
+        return rc;
     }
 
-    vec_clamp(P);
+    if ((pi = INTV_APPEND(P)) == NULL) {
+        return -ENOMEM;
+    }
+    *pi = 0;
+
+    while ((rc = next_line(fp, &hash)) == 1) {
+        i = sh_search(SH_AT(V, 0), EV_AT(E, 0), V->n, hash);
+        
+        if ((pi = INTV_APPEND(P)) == NULL) {
+            return -ENOMEM;
+        } 
+
+        *pi = i;
+    }
+
+    return vec_clamp(P);
 }
 
 // Search between K[low] and K[high] for an index where 
@@ -551,13 +605,17 @@ int merge_search(candidate_t **K, int low, int high, int j)
 // i is the index into the left string
 // E is the list of equivalence classes
 // p is the index of the first eq class matching left[i] in E
-int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
+//
+// Returns 0 on success or -ENOMEM on out of memory
+//
+int merge(candidate_t **K, int *pk, int i, eclass_t *E, int p)
 {
     int l = 0;
 
     candidate_t *c = K[0];
     candidate_t *t;
     int lowk = 0;
+    int k = *pk;
 
     for (; !l; l = E[p].last, p++) {
         int j = E[p].serial;
@@ -575,6 +633,9 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
         t = K[fndk];
         K[lowk] = c;        // save previous new entry
         c = candidate(i, j, t);
+        if (c == NULL) {
+            return -ENOMEM;
+        }
         lowk = fndk + 1;
 
         if (fndk == k) {
@@ -585,42 +646,59 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
     }
 
     K[lowk] = c;
-
-    return k;
+    *pk = k;
+    return 0;
 }
 
 // Take the equivalence relations between the left and right files
 // and compute the actual diff in the form of k-candidate chains
 //
-void dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *pk)
+// Returns 0 on success or -ENOMEM on out of memory
+//
+int dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *pk)
 {
+    int rc;
     int n = E->n;
     int m = P->n;
     int k_size = MIN(m, n) + 2;
     int k = 0;
     int i;
 
-    *K = (candidate_t **)safe_malloc(k_size * sizeof(candidate_t *));
+    if ((*K = (candidate_t **)malloc(k_size * sizeof(candidate_t *))) == NULL) {
+        return -ENOMEM;
+    }
 
-    (*K)[0] = candidate(0, 0, NULL);
-    (*K)[1] = candidate(m + 1, n + 1, NULL);
+    if (((*K)[0] = candidate(0, 0, NULL)) == NULL) {
+        return -ENOMEM;
+    }
+
+    if (((*K)[1] = candidate(m + 1, n + 1, NULL)) == NULL) {
+        return -ENOMEM;
+    }
 
     int *pp = INTV_AT(P, 0);
-    for (i = 1; i < m; i++) {
+    for (i = 1; i <= m; i++) {
         if (pp[i]) {
-            k = merge(*K, k, i, EV_AT(E, 0), pp[i]);
+            rc = merge(*K, &k, i, EV_AT(E, 0), pp[i]);
+            if (rc != 0) {
+                return rc;
+            }
         }
     }
 
     *pk = k;
+    return 0;
 }
 
 // Scan for jackpots (dissimilar lines which have the same hash)
 // If these are in J, then the lines aren't really equivalent and
 // we remove the relation.
 //
-void jackpot(int m, int *J, FILE *fp[])
+// Return 0 on success or -EIO on I/O error
+//
+int jackpot(int m, int *J, FILE *fp[])
 {
+    int rc;
     rewind(fp[0]);
     rewind(fp[1]);
     int l = 1;
@@ -633,27 +711,38 @@ void jackpot(int m, int *J, FILE *fp[])
         }
 
         if (l < i) {
-            skiplines(fp[0], i - l);
+            if ((rc = skiplines(fp[0], i - l)) != 0) {
+                return rc;
+            }
             l = i;
         }
 
         if (r < J[i]) {
-            skiplines(fp[1], J[i] - r);
+            if ((rc = skiplines(fp[1], J[i] - r)) != 0) {
+                return rc;
+            }
             r = J[i];
         }
 
-        if (complines(fp) != 0) {
+        if ((rc = complines(fp)) < 0) {
+            return rc;            
+        }
+        if (rc != 0) {
             printf("JACKPOT!\n");
             J[i] = 0;
         }
 
         l++, r++;
     }
+
+    return 0;
 }
 
 // Take the longest candidate chain and transform it into an array,
 // indexed by lines numbers of the left file, containing the matching
 // line number in the right file, or 0 if there is no matching line. 
+//
+// Returns the match array or NULL on out of memory
 //
 int *build_matches(int m, int n, candidate_t *kk)
 {
@@ -661,7 +750,11 @@ int *build_matches(int m, int n, candidate_t *kk)
     int *J;
     candidate_t *pc;
 
-    J = (int*)safe_malloc(sizeof(int*) * (m+1));
+    J = (int*)malloc(sizeof(int*) * (m+1));
+    if (J == NULL) {
+        return J;
+    }
+
     for (i = 0; i <= m; i++) {
         J[i] = 0;
     }
@@ -678,9 +771,15 @@ int *build_matches(int m, int n, candidate_t *kk)
 // build a representation of the differences in terms of blocks
 // of lines in each file.
 //
-void build_deltas(vec_t *dv, int m, int *J)
+// Return 0 on success or -ENOMEM on out of memory
+//
+int build_deltas(vec_t *dv, int m, int *J)
 {
-    DV_INIT(dv);
+    int rc;
+    
+    if ((rc = DV_INIT(dv)) != 0) {
+        return rc;
+    }
 
     int l = 0, r = 0;
     for (int i = 1; i <= m; i++) {
@@ -696,7 +795,9 @@ void build_deltas(vec_t *dv, int m, int *J)
             continue;
         }
 
-        delta = DV_APPEND(dv);
+        if ((delta = DV_APPEND(dv)) == NULL) {
+            return -ENOMEM;
+        }
         delta->left.start = l + 1;
         delta->left.end = i;
         delta->right.start = r + 1;
@@ -706,26 +807,40 @@ void build_deltas(vec_t *dv, int m, int *J)
         r = J[i];
     }
 
-    vec_clamp(dv);
+    return vec_clamp(dv);
 }
 
 // From the given file pointer, skip the next 'skip' lines, and
 // the print the next 'print' lines to stdout, each prefaced with
 // 'prefix' and a space.
 //
-void printrange(FILE *fp, int skip, int print, char prefix)
+// Return 0 on success or -EIO on I/O error
+//
+int printrange(FILE *fp, int skip, int print, char prefix)
 {
-    skiplines(fp, skip);
+    int rc;
+
+    if ((rc = skiplines(fp, skip)) != 0) {
+        return rc;
+    }
+
     while (print--) {
         printf("%c ", prefix);
-        printline(fp);
+        if ((rc = printline(fp)) != 0) {
+            return rc;
+        }
     }
+
+    return 0;
 }
 
 // Print the diff in ed-command format
 //
-void printdiff(FILE *fp[], vec_t *dv)
+// Return 0 on success or -EIO on I/O error
+//
+int printdiff(FILE *fp[], vec_t *dv)
 {
+    int rc;
     int l = 1;
     int r = 1;
 
@@ -741,7 +856,10 @@ void printdiff(FILE *fp[], vec_t *dv)
                 printf(",%d", delta->left.end - 1);
             }
             printf("d%d\n", delta->right.start - 1);
-            printrange(fp[0], delta->left.start - l, delta->left.end - delta->left.start, '<');
+            rc = printrange(fp[0], delta->left.start - l, delta->left.end - delta->left.start, '<');
+            if (rc != 0) {
+                return rc;
+            }
             l = delta->left.end;
         } else if (delta->left.start == delta->left.end) {
             printf("%da%d", delta->left.start - 1, delta->right.start);
@@ -749,7 +867,10 @@ void printdiff(FILE *fp[], vec_t *dv)
                 printf(",%d", delta->right.end - 1);
             }
             printf("\n"); 
-            printrange(fp[1], delta->right.start - r, delta->right.end - delta->right.start, '>');
+            rc = printrange(fp[1], delta->right.start - r, delta->right.end - delta->right.start, '>');
+            if (rc != 0) {
+                return rc;
+            }
             r = delta->right.end;
         } else {
             printf("%d", delta->left.start);
@@ -761,12 +882,20 @@ void printdiff(FILE *fp[], vec_t *dv)
                 printf(",%d", delta->right.end - 1);
             }
             printf("\n"); 
-            printrange(fp[0], delta->left.start - l, delta->left.end - delta->left.start, '<');
+            rc = printrange(fp[0], delta->left.start - l, delta->left.end - delta->left.start, '<');
+            if (rc != 0) {
+                return rc;
+            }
             l = delta->left.end;
-            printrange(fp[1], delta->right.start - r, delta->right.end - delta->right.start, '>');
+            rc = printrange(fp[1], delta->right.start - r, delta->right.end - delta->right.start, '>');
+            if (rc != 0) {
+                return rc;
+            }
             r = delta->right.end;
         }
     }
+
+    return 0;
 }
  
 // Print the (minimal) usage format
@@ -790,8 +919,8 @@ void freediff(diffstate_t *ds)
     vec_free(&ds->V);
     vec_free(&ds->E);
     vec_free(&ds->P);
-    safe_free(ds->K);
-    safe_free(ds->J);
+    free(ds->K);
+    free(ds->J);
     vec_free(&ds->dv);
 }
 
@@ -801,6 +930,7 @@ int main(int argc, char **argv)
     int i;
     int m, n;
     int k;
+    int rc;
 
     if (argc != 3) { 
         usage();
@@ -818,23 +948,53 @@ int main(int argc, char **argv)
         }
     } 
 
-    parse_right_file(ds.fp[1], &ds.V);
+    if ((rc = parse_right_file(ds.fp[1], &ds.V)) != 0) {
+        goto fail;
+    }
+
     sh_sort(&ds.V);
-    buildeq(&ds.V, &ds.E);
-    parse_left_file(ds.fp[0], &ds.V, &ds.E, &ds.P);
+    
+    if ((rc = buildeq(&ds.V, &ds.E)) != 0) {
+        goto fail;
+    }
+    
+    if ((rc = parse_left_file(ds.fp[0], &ds.V, &ds.E, &ds.P)) != 0) {
+        goto fail;
+    }
+
     vec_free(&ds.V);
 
     n = ds.E.n; 
     m = ds.P.n;
 
-    dodiff(&ds.E, &ds.P, &ds.K, &k);
-    ds.J = build_matches(m, n, ds.K[k]);
-    jackpot(m, ds.J, ds.fp);
+    if ((rc = dodiff(&ds.E, &ds.P, &ds.K, &k)) != 0) {
+        goto fail;
+    }
+
+    if ((ds.J = build_matches(m, n, ds.K[k])) == NULL) {
+        rc = -ENOMEM;
+        goto fail;
+    }
+
+    if ((rc = jackpot(m, ds.J, ds.fp)) != 0) {
+        goto fail;
+    }
 
     vec_t dv;
-    build_deltas(&ds.dv, m, ds.J);
+    if ((rc = build_deltas(&ds.dv, m, ds.J)) != 0) {
+        goto fail;
+    }
 
-    printdiff(ds.fp, &ds.dv);
+    if ((rc = printdiff(ds.fp, &ds.dv)) != 0) {
+        goto fail;
+    }
 
+    rc = ds.dv.n == 0 ? 0 : 1;
     freediff(&ds);
+    return rc;
+
+fail:
+    errno = -rc;
+    perror("diff");
+    return 2;
 }
