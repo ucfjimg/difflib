@@ -1,13 +1,10 @@
-//
-// TODO 
-//   better memory handling for library
-//   split into library interface
-//
 #include <err.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "diff.h"
 
 #ifndef MIN
 # define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -50,22 +47,6 @@ struct candidate_t {
     int a;
     int b;
     int prev;
-};
-
-// A range of lines, [start..end)
-//
-typedef struct range_t range_t; 
-struct range_t {
-    int start;
-    int end;
-};
-
-// A change between the two files; two ranges of lines that differ
-//
-typedef struct delta_t delta_t;
-struct delta_t {
-    range_t left;
-    range_t right;
 };
 
 // Overall state of the algorithm with everything needed to clean up
@@ -873,17 +854,21 @@ int printrange(FILE *fp, int skip, int print, char prefix)
 //
 // Return 0 on success or -EIO on I/O error
 //
-int printdiff(FILE *fp[], vec_t *dv)
+int printdiff(diff_t *df)
 {
+    FILE *fp[2];
     int rc;
     int l = 1;
     int r = 1;
 
+    fp[0] = df->fp[0];
+    fp[1] = df->fp[1];
+
     rewind(fp[0]);
     rewind(fp[1]);
 
-    for (int i = 0; i < dv->n; i++) {
-        delta_t *delta = DV_AT(dv, i);
+    for (int i = 0; i < df->ndelta; i++) {
+        delta_t *delta = &df->deltas[i];
 
         if (delta->right.start == delta->right.end) {
             printf("%d", delta->left.start);
@@ -933,24 +918,10 @@ int printdiff(FILE *fp[], vec_t *dv)
     return 0;
 }
  
-// Print the (minimal) usage format
-//
-void usage(void)
-{
-    fprintf(stderr, "diff: file-1 file-1\n");
-}
-
 // free all memory used by diff
 //
 void freediff(diffstate_t *ds)
 {
-    int i;
-    for (i = 0; i < 2; i++) {
-        if (ds->fp[i]) {
-            fclose(ds->fp[i]);
-        }
-    }
-
     vec_free(&ds->V);
     vec_free(&ds->E);
     vec_free(&ds->P);
@@ -960,29 +931,19 @@ void freediff(diffstate_t *ds)
     vec_free(&ds->cp);
 }
 
-int main(int argc, char **argv)
+// Run diff on the two given file pointers in `diff`
+//
+int diff(diff_t *diff)
 {
     diffstate_t ds;
-    int i;
     int m, n;
     int k;
     int rc;
 
-    if (argc != 3) { 
-        usage();
-        return 1;
-    }
-
     memset(&ds, 0, sizeof(ds));
 
-    for (i = 0; i < 2; i++) {
-        const char *fn = argv[i+1];
-        ds.fp[i] = fopen(fn, "rb");
-        if (!ds.fp[i]) {
-            perror(fn);
-            return 1;
-        }
-    }
+    ds.fp[0] = diff->fp[0];
+    ds.fp[1] = diff->fp[1];
 
     if ((rc = parse_right_file(ds.fp[1], &ds.V)) != 0) {
         goto fail;
@@ -1021,16 +982,19 @@ int main(int argc, char **argv)
         goto fail;
     }
 
-    if ((rc = printdiff(ds.fp, &ds.dv)) != 0) {
-        goto fail;
-    }
+    diff->ndelta = ds.dv.n;
+    diff->deltas = DV_AT(&ds.dv, 0);
 
-    rc = ds.dv.n == 0 ? 0 : 1;
+    ds.dv.alloc = 0;
+    ds.dv.n = 0;
+    ds.dv.data = NULL;
+
     freediff(&ds);
-    return rc;
+    return 0;
 
 fail:
-    errno = -rc;
-    perror("diff");
-    return 2;
+    freediff(&ds);
+    return rc;
 }
+
+
