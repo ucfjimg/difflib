@@ -5,6 +5,7 @@
 //
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef MIN
 # define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -61,6 +62,20 @@ typedef struct delta_t delta_t;
 struct delta_t {
     range_t left;
     range_t right;
+};
+
+// Overall state of the algorithm with everything needed to clean up
+// memory
+//
+typedef struct diffstate_t diffstate_t;
+struct diffstate_t {
+    FILE *fp[2];            // left and right file pointers 
+    vec_t V;                // (hash, serial) pairs of right hand file
+    vec_t E;                // (serial, last) pairs of right hand file eq classes
+    vec_t P;                // left hand file points by line into matching eq class in E
+    candidate_t **K;        // rightmost k-candidate pointers for each K
+    int *J;                 // left-right matchines at end of alg
+    vec_t dv;               // vector of delta ranges for output construction
 };
 
 /*****************************************************************************
@@ -147,15 +162,27 @@ void *vec_append(vec_t *pv)
     return &pv->data[pv->elesize * (pv->n - 1)];
 }
 
+// clamp a vector so its allocated size is the exactly the number of elements
+// in use. used to recover space reserved for new elements when it's known
+// that the vector will never again need to grow.
+//
+void vec_clamp(vec_t *pv)
+{
+    pv->data = safe_realloc(pv->data, pv->elesize * pv->n);
+    pv->alloc = pv->n;
+}
+
 //
 // Free a vector's data
 //
 void vec_free(vec_t *v)
 {
-    safe_free(v->data);
-    v->data = NULL;
-    v->alloc = 0;
-    v->n = 0;
+    if (v->data) {
+        safe_free(v->data);
+        v->data = NULL;
+        v->alloc = 0;
+        v->n = 0;
+    }
 }
 
 /*****************************************************************************
@@ -432,6 +459,8 @@ void parse_right_file(FILE *fp, vec_t *V)
         sh->serial = V->n - 1;
         sh->hash = hash;
     }
+
+    vec_clamp(V);
 }
 
 //
@@ -458,6 +487,8 @@ void buildeq(vec_t *V, vec_t *E)
         ec->serial = sh->serial;
         ec->last = (i == V->n - 1) || (sh->hash != sh[1].hash); 
     }
+
+    vec_clamp(E);
 }
 
 //
@@ -476,6 +507,8 @@ void parse_left_file(FILE *fp, vec_t *V, vec_t *E, vec_t *P)
         i = sh_search(SH_AT(V, 0), EV_AT(E, 0), V->n, hash);
         *INTV_APPEND(P) = i;
     }
+
+    vec_clamp(P);
 }
 
 // Search between K[low] and K[high] for an index where 
@@ -559,24 +592,27 @@ int merge(candidate_t **K, int k, int i, eclass_t *E, int p)
 // Take the equivalence relations between the left and right files
 // and compute the actual diff in the form of k-candidate chains
 //
-void dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *k)
+void dodiff(vec_t *E, vec_t *P, candidate_t ***K, int *pk)
 {
     int n = E->n;
     int m = P->n;
     int k_size = MIN(m, n) + 2;
-    *K = (candidate_t **)safe_malloc(k_size * sizeof(candidate_t *));
-    *k = 0;
+    int k = 0;
     int i;
+
+    *K = (candidate_t **)safe_malloc(k_size * sizeof(candidate_t *));
 
     (*K)[0] = candidate(0, 0, NULL);
     (*K)[1] = candidate(m + 1, n + 1, NULL);
 
     int *pp = INTV_AT(P, 0);
-    for (i = 1; i <= m; i++) {
+    for (i = 1; i < m; i++) {
         if (pp[i]) {
-            *k = merge(*K, *k, i, EV_AT(E, 0), pp[i]);
+            k = merge(*K, k, i, EV_AT(E, 0), pp[i]);
         }
     }
+
+    *pk = k;
 }
 
 // Scan for jackpots (dissimilar lines which have the same hash)
@@ -669,6 +705,8 @@ void build_deltas(vec_t *dv, int m, int *J)
         l = i;
         r = J[i];
     }
+
+    vec_clamp(dv);
 }
 
 // From the given file pointer, skip the next 'skip' lines, and
@@ -738,47 +776,65 @@ void usage(void)
     fprintf(stderr, "diff: file-1 file-1\n");
 }
 
+// free all memory used by diff
+//
+void freediff(diffstate_t *ds)
+{
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (ds->fp[i]) {
+            fclose(ds->fp[i]);
+        }
+    }
+
+    vec_free(&ds->V);
+    vec_free(&ds->E);
+    vec_free(&ds->P);
+    safe_free(ds->K);
+    safe_free(ds->J);
+    vec_free(&ds->dv);
+}
+
 int main(int argc, char **argv)
 {
-    FILE *fp[2];
+    diffstate_t ds;
     int i;
-    vec_t V;
-    vec_t E;
-    vec_t P;
     int m, n;
     int k;
-    candidate_t **K;
-    int *J;
 
     if (argc != 3) { 
         usage();
         return 1;
     }
 
+    memset(&ds, 0, sizeof(ds));
+
     for (i = 0; i < 2; i++) {
         const char *fn = argv[i+1];
-        fp[i] = fopen(fn, "rb");
-        if (!fp[i]) {
+        ds.fp[i] = fopen(fn, "rb");
+        if (!ds.fp[i]) {
             perror(fn);
             return 1;
         }
     } 
 
-    parse_right_file(fp[1], &V);
-    sh_sort(&V);
-    buildeq(&V, &E);
-    parse_left_file(fp[0], &V, &E, &P);
-    vec_free(&V);
+    parse_right_file(ds.fp[1], &ds.V);
+    sh_sort(&ds.V);
+    buildeq(&ds.V, &ds.E);
+    parse_left_file(ds.fp[0], &ds.V, &ds.E, &ds.P);
+    vec_free(&ds.V);
 
-    n = E.n; 
-    m = P.n;
+    n = ds.E.n; 
+    m = ds.P.n;
 
-    dodiff(&E, &P, &K, &k);
-    J = build_matches(m, n, K[k]);
-    jackpot(m, J, fp);
+    dodiff(&ds.E, &ds.P, &ds.K, &k);
+    ds.J = build_matches(m, n, ds.K[k]);
+    jackpot(m, ds.J, ds.fp);
 
     vec_t dv;
-    build_deltas(&dv, m, J);
+    build_deltas(&ds.dv, m, ds.J);
 
-    printdiff(fp, &dv);
+    printdiff(ds.fp, &ds.dv);
+
+    freediff(&ds);
 }
